@@ -12,6 +12,7 @@ import org.springframework.data.domain.Page;
 import org.springframework.data.domain.PageRequest;
 import org.springframework.data.domain.Sort;
 import org.springframework.http.ResponseEntity;
+import org.springframework.security.access.AccessDeniedException;
 import org.springframework.security.access.prepost.PreAuthorize;
 import org.springframework.security.core.annotation.AuthenticationPrincipal;
 import org.springframework.web.bind.annotation.*;
@@ -57,10 +58,15 @@ public class UserController {
             @RequestParam(defaultValue = "0") int page,
             @RequestParam(defaultValue = "15") int size,
             @RequestParam(defaultValue = "createdAt") String sortBy,
-            @RequestParam(defaultValue = "desc") String direction) {
+            @RequestParam(defaultValue = "desc") String direction,
+            @AuthenticationPrincipal UserPrincipal principal) {
+
+        // Scope to own account if not admin
+        boolean isAdmin = principal != null && principal.getUser().getRole() != null && principal.getUser().getRole().contains("ADMIN");
+        String effectiveQuery = (!isAdmin && principal != null) ? principal.getUser().getEmail() : query;
 
         Sort sort = "desc".equalsIgnoreCase(direction) ? Sort.by(sortBy).descending() : Sort.by(sortBy).ascending();
-        Page<UserResponseDto> users = userService.getAllUsers(query, role, provider, status, PageRequest.of(page, size, sort));
+        Page<UserResponseDto> users = userService.getAllUsers(effectiveQuery, role, provider, status, PageRequest.of(page, size, sort));
         return ResponseEntity.ok(ApiResponseDto.success("Users retrieved", users));
     }
 
@@ -69,6 +75,11 @@ public class UserController {
     public ResponseEntity<ApiResponseDto<UserDetailResponseDto>> getUserDetail(
             @PathVariable Long id,
             @AuthenticationPrincipal UserPrincipal principal) {
+
+        boolean isAdmin = principal != null && principal.getUser().getRole() != null && principal.getUser().getRole().contains("ADMIN");
+        if (!isAdmin && principal != null && !principal.getUser().getId().equals(id)) {
+            throw new AccessDeniedException("You only have permission to view your own account details.");
+        }
 
         UserDetailResponseDto detail = userService.getUserDetail(id, principal != null ? principal.getCurrentSessionId() : null);
         return ResponseEntity.ok(ApiResponseDto.success("User details retrieved", detail));
@@ -91,7 +102,13 @@ public class UserController {
     @PreAuthorize("hasRole('ADMIN') or #id == authentication.principal.user.id")
     @Operation(summary = "Delete user", description = "Deletes user account, invalidates sessions, and broadcasts Kafka deletion event")
     public ResponseEntity<ApiResponseDto<Void>> deleteUser(
-            @PathVariable Long id) {
+            @PathVariable Long id,
+            @AuthenticationPrincipal UserPrincipal principal) {
+
+        boolean isAdmin = principal != null && principal.getUser().getRole() != null && principal.getUser().getRole().contains("ADMIN");
+        if (!isAdmin && principal != null && !principal.getUser().getId().equals(id)) {
+            throw new AccessDeniedException("You only have permission to delete your own account.");
+        }
 
         userService.deleteUser(id);
         return ResponseEntity.ok(ApiResponseDto.success("User deleted successfully."));

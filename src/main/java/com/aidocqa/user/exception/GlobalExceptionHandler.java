@@ -5,6 +5,7 @@ import lombok.extern.slf4j.Slf4j;
 import org.springframework.http.HttpStatus;
 import org.springframework.http.ResponseEntity;
 import org.springframework.security.access.AccessDeniedException;
+import org.springframework.security.authentication.BadCredentialsException;
 import org.springframework.web.bind.MethodArgumentNotValidException;
 import org.springframework.web.bind.annotation.ExceptionHandler;
 import org.springframework.web.bind.annotation.RestControllerAdvice;
@@ -31,6 +32,14 @@ public class GlobalExceptionHandler {
                 .body(ApiResponseDto.error(ex.getMessage()));
     }
 
+    @ExceptionHandler(BadCredentialsException.class)
+    public ResponseEntity<ApiResponseDto<Void>> handleBadCredentials(BadCredentialsException ex) {
+        log.warn("Bad credentials: {}", ex.getMessage());
+        return ResponseEntity
+                .status(HttpStatus.UNAUTHORIZED)
+                .body(ApiResponseDto.error("Invalid email or password. Please verify your credentials."));
+    }
+
     @ExceptionHandler(AccessDeniedException.class)
     public ResponseEntity<ApiResponseDto<Void>> handleAccessDenied(AccessDeniedException ex) {
         log.warn("Access denied: {}", ex.getMessage());
@@ -50,6 +59,24 @@ public class GlobalExceptionHandler {
                 .body(ApiResponseDto.error(errors));
     }
 
+    @ExceptionHandler(RuntimeException.class)
+    public ResponseEntity<ApiResponseDto<Void>> handleRuntimeException(RuntimeException ex) {
+        if (isClientAbort(ex)) {
+            log.debug("Client closed/aborted connection: {}", ex.getMessage());
+            return null;
+        }
+        log.warn("Application runtime exception: {}", ex.getMessage(), ex);
+        String msg = ex.getMessage();
+        if (msg != null && !msg.isBlank() && !msg.contains("Exception") && !msg.contains("at ") && !msg.contains("com.") && !msg.contains("org.")) {
+            return ResponseEntity
+                    .status(HttpStatus.BAD_REQUEST)
+                    .body(ApiResponseDto.error(msg));
+        }
+        return ResponseEntity
+                .status(HttpStatus.INTERNAL_SERVER_ERROR)
+                .body(ApiResponseDto.error("An unexpected error occurred. Please try again."));
+    }
+
     @ExceptionHandler(Exception.class)
     public ResponseEntity<ApiResponseDto<Void>> handleGenericException(Exception ex) {
         if (isClientAbort(ex)) {
@@ -59,7 +86,7 @@ public class GlobalExceptionHandler {
         log.error("Unexpected server error: {}", ex.getMessage(), ex);
         return ResponseEntity
                 .status(HttpStatus.INTERNAL_SERVER_ERROR)
-                .body(ApiResponseDto.error("An unexpected error occurred. Please try again."));
+                .body(ApiResponseDto.error("An unexpected server error occurred. Please try again."));
     }
 
     private boolean isClientAbort(Throwable ex) {

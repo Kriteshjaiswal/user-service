@@ -1,7 +1,9 @@
 package com.aidocqa.user.security;
 
 import com.aidocqa.user.entity.User;
+import com.aidocqa.user.repository.UserRepository;
 import com.aidocqa.user.service.SessionService;
+import io.jsonwebtoken.Claims;
 import jakarta.servlet.FilterChain;
 import jakarta.servlet.ServletException;
 import jakarta.servlet.http.Cookie;
@@ -16,6 +18,7 @@ import org.springframework.stereotype.Component;
 import org.springframework.web.filter.OncePerRequestFilter;
 
 import java.io.IOException;
+import java.util.Optional;
 
 @Slf4j
 @Component
@@ -23,36 +26,61 @@ import java.io.IOException;
 public class SessionAuthenticationFilter extends OncePerRequestFilter {
 
     private final SessionService sessionService;
+    private final JwtService jwtService;
+    private final UserRepository userRepository;
 
     @Override
     protected void doFilterInternal(HttpServletRequest request, HttpServletResponse response, FilterChain filterChain)
             throws ServletException, IOException {
 
-        String sessionId = extractSessionId(request);
+        String tokenOrSessionId = extractTokenOrSessionId(request);
 
-        if (sessionId != null && !sessionId.isBlank() && SecurityContextHolder.getContext().getAuthentication() == null) {
+        if (tokenOrSessionId != null && !tokenOrSessionId.isBlank() && SecurityContextHolder.getContext().getAuthentication() == null) {
             try {
-                User user = sessionService.validateAndSlideSession(sessionId);
-                UserPrincipal principal = new UserPrincipal(user, sessionId);
+                User user = null;
+                String activeSessionId = null;
 
-                UsernamePasswordAuthenticationToken authToken = new UsernamePasswordAuthenticationToken(
-                        principal,
-                        null,
-                        principal.getAuthorities()
-                );
-                authToken.setDetails(new WebAuthenticationDetailsSource().buildDetails(request));
-                SecurityContextHolder.getContext().setAuthentication(authToken);
+                // 1. Try treating as JWT token first if dots exist
+                if (tokenOrSessionId.contains(".")) {
+                    try {
+                        Claims claims = jwtService.extractAllClaims(tokenOrSessionId);
+                        String email = claims.getSubject();
+                        if (email != null && !jwtService.isTokenExpired(tokenOrSessionId)) {
+                            Optional<User> uOpt = userRepository.findByEmail(email);
+                            if (uOpt.isPresent()) {
+                                user = uOpt.get();
+                                activeSessionId = claims.get("sessionId", String.class);
+                            }
+                        }
+                    } catch (Exception ignored) {}
+                }
+
+                // 2. If not JWT or JWT fallback, validate via active session store
+                if (user == null) {
+                    user = sessionService.validateAndSlideSession(tokenOrSessionId);
+                    activeSessionId = tokenOrSessionId;
+                }
+
+                if (user != null) {
+                    UserPrincipal principal = new UserPrincipal(user, activeSessionId);
+                    UsernamePasswordAuthenticationToken authToken = new UsernamePasswordAuthenticationToken(
+                            principal,
+                            null,
+                            principal.getAuthorities()
+                    );
+                    authToken.setDetails(new WebAuthenticationDetailsSource().buildDetails(request));
+                    SecurityContextHolder.getContext().setAuthentication(authToken);
+                }
             } catch (Exception e) {
-                log.debug("Session validation check failed: {}", e.getMessage());
-                // Do not fail immediately; let Spring Security authorization rule decide for protected endpoints
+                log.debug("Auth validation check failed: {}", e.getMessage());
             }
         }
 
         filterChain.doFilter(request, response);
     }
 
-    private String extractSessionId(HttpServletRequest request) {
-        // 1. Check Authorization: Bearer <sessionId>
+    private String extractTokenOrSessionId(HttpServletRequest request) {
+        // 1. Check Authorization: Bearer <token/sessionId>
         String authHeader = request.getHeader("Authorization");
         if (authHeader != null && authHeader.startsWith("Bearer ")) {
             return authHeader.substring(7).trim();

@@ -28,6 +28,7 @@ public class AuthService {
     private final OAuthService oauthService;
     private final UserEventProducer eventProducer;
     private final PasswordEncoder passwordEncoder;
+    private final com.aidocqa.user.security.JwtService jwtService;
 
     /**
      * User registration with 4-digit OTP email verification.
@@ -36,45 +37,28 @@ public class AuthService {
     public AuthResponseDto register(RegisterRequestDto request, String ipAddress, String userAgent) {
         String normalizedEmail = request.getEmail().trim().toLowerCase();
 
-        if (userRepository.existsByEmail(normalizedEmail)) {
+        Optional<User> existingUserOpt = userRepository.findByEmail(normalizedEmail);
+        if (existingUserOpt.isPresent() && existingUserOpt.get().isEmailVerified()) {
             throw new IllegalArgumentException("An account with this email address already exists. Please log in.");
         }
 
-        User user = User.builder()
-                .fullName(request.getFullName().trim())
-                .email(normalizedEmail)
-                .passwordHash(passwordEncoder.encode(request.getPassword()))
-                .role("ROLE_USER")
-                .provider("LOCAL")
-                .isEmailVerified(false)
-                .accountStatus("PENDING_VERIFICATION")
-                .build();
+        // Hash password
+        String passwordHash = passwordEncoder.encode(request.getPassword());
 
-        User savedUser = userRepository.save(user);
-
-        // Generate 4-digit OTP and send email
-        emailOtpService.createAndSendVerification(savedUser, "REGISTRATION");
-
-        eventProducer.publishUserCreated(UserCreatedEvent.builder()
-                .userId(savedUser.getId())
-                .email(savedUser.getEmail())
-                .fullName(savedUser.getFullName())
-                .provider("LOCAL")
-                .role(savedUser.getRole())
-                .build());
-
-        auditLogRepository.save(UserAuditLog.builder()
-                .userId(savedUser.getId())
-                .action("REGISTER_INITIATED")
-                .ipAddress(ipAddress)
-                .userAgent(userAgent)
-                .details("Registered account; 4-digit OTP verification email sent")
-                .build());
+        // Store pending registration in temporary storage until 4-digit OTP is successfully verified (ZERO DB PERSISTENCE)
+        emailOtpService.createAndSendRegistrationVerification(normalizedEmail, request.getFullName().trim(), passwordHash);
 
         return AuthResponseDto.builder()
                 .requiresOtpVerification(true)
-                .message("Account created. Please enter the 4-digit OTP sent to " + savedUser.getEmail())
-                .user(mapToUserResponse(savedUser, 0, null))
+                .message("Account verification pending. Please enter the 4-digit OTP sent to " + normalizedEmail)
+                .user(UserResponseDto.builder()
+                        .fullName(request.getFullName().trim())
+                        .email(normalizedEmail)
+                        .role("ROLE_USER")
+                        .provider("LOCAL")
+                        .emailVerified(false)
+                        .accountStatus("PENDING_VERIFICATION")
+                        .build())
                 .build();
     }
 
@@ -128,9 +112,11 @@ public class AuthService {
                 .details("Session login successful")
                 .build());
 
+        String jwtToken = jwtService.generateToken(user, session.getId());
+
         return AuthResponseDto.builder()
                 .sessionId(session.getId())
-                .token(session.getId()) // Interoperable with Token and Session headers
+                .token(jwtToken)
                 .requiresOtpVerification(false)
                 .message("Login successful")
                 .user(mapToUserResponse(user, 1, session.getLastActivityAt()))
@@ -144,10 +130,11 @@ public class AuthService {
     public AuthResponseDto verifyOtpAndLogin(VerifyOtpRequestDto request, String ipAddress, String userAgent) {
         User verifiedUser = emailOtpService.verifyOtp(request.getEmail().trim().toLowerCase(), request.getOtpCode().trim());
         UserSession session = sessionService.createSession(verifiedUser.getId(), ipAddress, userAgent);
+        String jwtToken = jwtService.generateToken(verifiedUser, session.getId());
 
         return AuthResponseDto.builder()
                 .sessionId(session.getId())
-                .token(session.getId())
+                .token(jwtToken)
                 .requiresOtpVerification(false)
                 .message("Email verified successfully. Welcome to DocuMind!")
                 .user(mapToUserResponse(verifiedUser, 1, session.getLastActivityAt()))
@@ -161,10 +148,11 @@ public class AuthService {
     public AuthResponseDto verifyMagicLinkAndLogin(String token, String ipAddress, String userAgent) {
         User verifiedUser = emailOtpService.verifyMagicLink(token);
         UserSession session = sessionService.createSession(verifiedUser.getId(), ipAddress, userAgent);
+        String jwtToken = jwtService.generateToken(verifiedUser, session.getId());
 
         return AuthResponseDto.builder()
                 .sessionId(session.getId())
-                .token(session.getId())
+                .token(jwtToken)
                 .requiresOtpVerification(false)
                 .message("Email verified successfully via magic link.")
                 .user(mapToUserResponse(verifiedUser, 1, session.getLastActivityAt()))
@@ -176,9 +164,7 @@ public class AuthService {
      */
     @Transactional
     public void resendOtp(String email) {
-        User user = userRepository.findByEmail(email.trim().toLowerCase())
-                .orElseThrow(() -> new IllegalArgumentException("User not found with email: " + email));
-        emailOtpService.createAndSendVerification(user, "REGISTRATION");
+        emailOtpService.resendRegistrationOtp(email.trim().toLowerCase());
     }
 
     /**
@@ -186,12 +172,15 @@ public class AuthService {
      */
     @Transactional
     public AuthResponseDto oauthLogin(String provider, OAuthLoginRequestDto request, String ipAddress, String userAgent) {
-        User user = oauthService.processOAuthLogin(provider, request.getCode(), request.getRedirectUri(), ipAddress);
+        OAuthService.OAuthResult result = oauthService.processOAuthLogin(provider, request.getCode(), request.getRedirectUri(), ipAddress);
+        User user = result.user();
         UserSession session = sessionService.createSession(user.getId(), ipAddress, userAgent);
+        String jwtToken = jwtService.generateToken(user, session.getId());
 
         return AuthResponseDto.builder()
                 .sessionId(session.getId())
-                .token(session.getId())
+                .token(jwtToken)
+                .isNewUser(result.isNewUser())
                 .requiresOtpVerification(false)
                 .message(provider.toUpperCase() + " authentication successful")
                 .user(mapToUserResponse(user, 1, session.getLastActivityAt()))

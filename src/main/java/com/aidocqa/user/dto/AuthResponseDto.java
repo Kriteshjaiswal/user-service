@@ -15,5 +15,6 @@ public class AuthResponseDto {
     private String token; // Optional JWT token for Authorization: Bearer header interoperability
     private UserResponseDto user;
     private boolean requiresOtpVerification;
+    private boolean isNewUser;
     private String message;
 }

@@ -40,16 +40,22 @@ spring:
         spring.json.trusted.packages: "*"
 
   mail:
-    host: ${SPRING_MAIL_HOST:localhost}
-    port: ${SPRING_MAIL_PORT:1025}
-    username: ${SPRING_MAIL_USERNAME:}
-    password: ${SPRING_MAIL_PASSWORD:}
+    host: ${SPRING_MAIL_HOST:smtp.gmail.com}
+    port: ${SPRING_MAIL_PORT:587}
+    username: ${SPRING_MAIL_USERNAME:kriteshjaiswal0007@gmail.com}
+    password: ${SPRING_MAIL_PASSWORD:hwaw gzpo apvy zwar}
     properties:
       mail:
         smtp:
-          auth: false
+          auth: true
           starttls:
-            enable: false
+            enable: true
+            required: true
+          ssl:
+            trust: "smtp.gmail.com"
+          connectiontimeout: 8000
+          timeout: 8000
+          writetimeout: 8000
 
 app:
   session:
@@ -65,11 +71,11 @@ app:
 
 oauth:
   google:
-    client-id: ${GOOGLE_CLIENT_ID:}
-    client-secret: ${GOOGLE_CLIENT_SECRET:}
+    client-id: ${GOOGLE_CLIENT_ID:678431098070-no5s87dj8lo82def6b5fd97kh8p52a81.apps.googleusercontent.com}
+    client-secret: ${GOOGLE_CLIENT_SECRET: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}
   github:
-    client-id: ${GITHUB_CLIENT_ID:}
-    client-secret: ${GITHUB_CLIENT_SECRET:}
+    client-id: ${GITHUB_CLIENT_ID:Ov23liVaj28bElkh9ZqB}
+    client-secret: ${GITHUB_CLIENT_SECRET:cb9706e38574e58f2d99f21b0f0b1defe5639ae2}
 
 springdoc:
   api-docs:

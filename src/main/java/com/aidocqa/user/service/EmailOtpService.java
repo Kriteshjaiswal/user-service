@@ -42,19 +42,65 @@ public class EmailOtpService {
     @Value("${app.frontend-url:http://localhost:5173}")
     private String frontendUrl;
 
+    @Value("${spring.mail.username:kriteshjaiswal0007@gmail.com}")
+    private String mailUsername;
+
+    // Temporary storage for pending registrations (Zero DB persistence before successful verification)
+    private final java.util.concurrent.ConcurrentHashMap<String, PendingRegistration> pendingRegistrations = new java.util.concurrent.ConcurrentHashMap<>();
+    private final java.util.concurrent.ConcurrentHashMap<String, String> tokenToEmailMap = new java.util.concurrent.ConcurrentHashMap<>();
+
+    @lombok.Data
+    @lombok.Builder
+    @lombok.NoArgsConstructor
+    @lombok.AllArgsConstructor
+    public static class PendingRegistration {
+        private String email;
+        private String fullName;
+        private String passwordHash;
+        private String otpCode;
+        private String magicToken;
+        private LocalDateTime expiresAt;
+        private int attempts;
+    }
+
     /**
-     * Generates a 4-digit numeric OTP and a unique magic verification token,
-     * stores it in the database with 10-minute validity, and sends the verification email.
+     * Stores pending registration in-memory with 10-min expiration (NO DB INSERT),
+     * and sends 4-digit OTP and 1-click magic link.
+     */
+    public void createAndSendRegistrationVerification(String email, String fullName, String passwordHash) {
+        String normalizedEmail = email.trim().toLowerCase();
+        int codeInt = 1000 + RANDOM.nextInt(9000);
+        String otpCode = String.valueOf(codeInt);
+        String magicToken = UUID.randomUUID().toString().replace("-", "");
+        LocalDateTime expiresAt = LocalDateTime.now().plusMinutes(otpExpirationMinutes);
+
+        PendingRegistration pending = PendingRegistration.builder()
+                .email(normalizedEmail)
+                .fullName(fullName)
+                .passwordHash(passwordHash)
+                .otpCode(otpCode)
+                .magicToken(magicToken)
+                .expiresAt(expiresAt)
+                .attempts(0)
+                .build();
+
+        pendingRegistrations.put(normalizedEmail, pending);
+        tokenToEmailMap.put(magicToken, normalizedEmail);
+
+        String magicLinkUrl = String.format("%s/verify-email?token=%s", frontendUrl, magicToken);
+
+        sendHtmlVerificationEmail(normalizedEmail, fullName, otpCode, magicLinkUrl);
+        log.info("Generated 4-digit OTP [{}] for pending registration: {} (Expires in {} mins)", otpCode, normalizedEmail, otpExpirationMinutes);
+    }
+
+    /**
+     * Generates a 4-digit numeric OTP for an existing unverified user.
      */
     @Transactional
     public UserVerification createAndSendVerification(User user, String type) {
-        // Generate secure 4-digit numeric OTP (e.g. 1000 - 9999)
         int codeInt = 1000 + RANDOM.nextInt(9000);
         String otpCode = String.valueOf(codeInt);
-
-        // Generate magic link token UUID
         String magicToken = UUID.randomUUID().toString().replace("-", "");
-
         LocalDateTime expiresAt = LocalDateTime.now().plusMinutes(otpExpirationMinutes);
 
         UserVerification verification = UserVerification.builder()
@@ -68,20 +114,7 @@ public class EmailOtpService {
                 .build();
 
         UserVerification saved = verificationRepository.save(verification);
-
-        // Construct magic link URL
         String magicLinkUrl = String.format("%s/verify-email?token=%s", frontendUrl, magicToken);
-
-        // Publish to Kafka for asynchronous notification worker
-        eventProducer.publishEmailOtp(EmailOtpEvent.builder()
-                .recipientEmail(user.getEmail())
-                .recipientName(user.getFullName())
-                .otpCode(otpCode)
-                .magicLinkUrl(magicLinkUrl)
-                .expirationMinutes(otpExpirationMinutes)
-                .build());
-
-        // Send direct HTML email as well
         sendHtmlVerificationEmail(user.getEmail(), user.getFullName(), otpCode, magicLinkUrl);
 
         log.info("Generated 4-digit OTP [{}] for user: {} (Expires in {} mins)", otpCode, user.getEmail(), otpExpirationMinutes);
@@ -89,15 +122,70 @@ public class EmailOtpService {
     }
 
     /**
-     * Validates 4-digit OTP submitted by the user.
+     * Validates 4-digit OTP. If from pending registration, SAVES user to database ONLY NOW upon success.
      */
     @Transactional
     public User verifyOtp(String email, String otpCode) {
-        User user = userRepository.findByEmail(email)
-                .orElseThrow(() -> new IllegalArgumentException("User not found with email: " + email));
+        String normalizedEmail = email != null ? email.trim().toLowerCase() : "";
+        String normalizedCode = otpCode != null ? otpCode.trim() : "";
+
+        // 1. Check in-memory pending registration
+        PendingRegistration pending = pendingRegistrations.get(normalizedEmail);
+        if (pending != null) {
+            if (pending.getExpiresAt().isBefore(LocalDateTime.now())) {
+                pendingRegistrations.remove(normalizedEmail);
+                tokenToEmailMap.remove(pending.getMagicToken());
+                throw new IllegalArgumentException("The verification code has expired. Please register again.");
+            }
+
+            pending.setAttempts(pending.getAttempts() + 1);
+            if (pending.getAttempts() > 5) {
+                pendingRegistrations.remove(normalizedEmail);
+                tokenToEmailMap.remove(pending.getMagicToken());
+                throw new IllegalArgumentException("Too many invalid attempts. Please register again.");
+            }
+
+            if (!pending.getOtpCode().equals(normalizedCode)) {
+                throw new IllegalArgumentException("Invalid 4-digit OTP. Please check your email and try again.");
+            }
+
+            // OTP verified successfully! NOW create and save User in MySQL database
+            User newUser = User.builder()
+                    .fullName(pending.getFullName())
+                    .email(pending.getEmail())
+                    .passwordHash(pending.getPasswordHash())
+                    .role("ROLE_USER")
+                    .provider("LOCAL")
+                    .isEmailVerified(true)
+                    .accountStatus("ACTIVE")
+                    .build();
+
+            User savedUser = userRepository.save(newUser);
+
+            pendingRegistrations.remove(normalizedEmail);
+            tokenToEmailMap.remove(pending.getMagicToken());
+
+            try {
+                auditLogRepository.save(UserAuditLog.builder()
+                        .userId(savedUser.getId())
+                        .action("OTP_VERIFIED")
+                        .details("4-digit OTP verified; user account created and activated")
+                        .build());
+            } catch (Exception e) {
+                log.warn("Audit log save skipped: {}", e.getMessage());
+            }
+
+            log.info("User {} successfully registered and verified with OTP code.", savedUser.getEmail());
+            return savedUser;
+        }
+
+        // 2. Check existing unverified user in database (backward compatibility)
+        User user = userRepository.findByEmail(normalizedEmail)
+                .orElseThrow(() -> new IllegalArgumentException("No pending verification request found for email: " + email));
 
         UserVerification verification = verificationRepository
                 .findTopByUserIdAndTypeAndIsUsedFalseOrderByCreatedAtDesc(user.getId(), "REGISTRATION")
+                .or(() -> verificationRepository.findTopByUserIdAndIsUsedFalseOrderByCreatedAtDesc(user.getId()))
                 .orElseThrow(() -> new IllegalArgumentException("No pending verification request found. Please request a new code."));
 
         if (verification.isExpired()) {
@@ -112,31 +200,17 @@ public class EmailOtpService {
             throw new IllegalArgumentException("Too many invalid attempts. Please request a new verification code.");
         }
 
-        if (!verification.getOtpCode().equals(otpCode.trim())) {
+        if (!verification.getOtpCode().equals(normalizedCode)) {
             verificationRepository.save(verification);
             throw new IllegalArgumentException("Invalid 4-digit OTP. Please check your email and try again.");
         }
 
-        // Mark verification used & activate user
         verification.setUsed(true);
         verificationRepository.save(verification);
 
         user.setEmailVerified(true);
         user.setAccountStatus("ACTIVE");
         User updatedUser = userRepository.save(user);
-
-        // Publish Kafka UserVerifiedEvent
-        eventProducer.publishUserVerified(UserVerifiedEvent.builder()
-                .userId(user.getId())
-                .email(user.getEmail())
-                .verifiedAt(LocalDateTime.now())
-                .build());
-
-        auditLogRepository.save(UserAuditLog.builder()
-                .userId(user.getId())
-                .action("OTP_VERIFIED")
-                .details("4-digit OTP verified successfully via email code")
-                .build());
 
         log.info("User {} successfully verified with OTP code.", user.getEmail());
         return updatedUser;
@@ -147,6 +221,36 @@ public class EmailOtpService {
      */
     @Transactional
     public User verifyMagicLink(String token) {
+        String normalizedEmail = tokenToEmailMap.get(token);
+        if (normalizedEmail != null) {
+            PendingRegistration pending = pendingRegistrations.get(normalizedEmail);
+            if (pending != null) {
+                if (pending.getExpiresAt().isBefore(LocalDateTime.now())) {
+                    pendingRegistrations.remove(normalizedEmail);
+                    tokenToEmailMap.remove(token);
+                    throw new IllegalArgumentException("This verification link has expired. Please register again.");
+                }
+
+                // Create and save User in MySQL database
+                User newUser = User.builder()
+                        .fullName(pending.getFullName())
+                        .email(pending.getEmail())
+                        .passwordHash(pending.getPasswordHash())
+                        .role("ROLE_USER")
+                        .provider("LOCAL")
+                        .isEmailVerified(true)
+                        .accountStatus("ACTIVE")
+                        .build();
+
+                User savedUser = userRepository.save(newUser);
+                pendingRegistrations.remove(normalizedEmail);
+                tokenToEmailMap.remove(token);
+
+                log.info("User {} successfully registered and verified via magic link.", savedUser.getEmail());
+                return savedUser;
+            }
+        }
+
         UserVerification verification = verificationRepository.findByTokenAndIsUsedFalse(token)
                 .orElseThrow(() -> new IllegalArgumentException("Invalid or already used verification link."));
 
@@ -162,22 +266,31 @@ public class EmailOtpService {
 
         user.setEmailVerified(true);
         user.setAccountStatus("ACTIVE");
-        User updatedUser = userRepository.save(user);
+        return userRepository.save(user);
+    }
 
-        eventProducer.publishUserVerified(UserVerifiedEvent.builder()
-                .userId(user.getId())
-                .email(user.getEmail())
-                .verifiedAt(LocalDateTime.now())
-                .build());
+    /**
+     * Resends OTP code for pending registration or existing user.
+     */
+    public void resendRegistrationOtp(String email) {
+        String normalizedEmail = email != null ? email.trim().toLowerCase() : "";
+        PendingRegistration pending = pendingRegistrations.get(normalizedEmail);
+        if (pending != null) {
+            int codeInt = 1000 + RANDOM.nextInt(9000);
+            String otpCode = String.valueOf(codeInt);
+            pending.setOtpCode(otpCode);
+            pending.setExpiresAt(LocalDateTime.now().plusMinutes(otpExpirationMinutes));
+            pending.setAttempts(0);
 
-        auditLogRepository.save(UserAuditLog.builder()
-                .userId(user.getId())
-                .action("MAGIC_LINK_VERIFIED")
-                .details("Email verified via 1-click magic link token")
-                .build());
+            String magicLinkUrl = String.format("%s/verify-email?token=%s", frontendUrl, pending.getMagicToken());
+            sendHtmlVerificationEmail(normalizedEmail, pending.getFullName(), otpCode, magicLinkUrl);
+            log.info("Resent 4-digit OTP [{}] to: {}", otpCode, normalizedEmail);
+            return;
+        }
 
-        log.info("User {} successfully verified via magic link.", user.getEmail());
-        return updatedUser;
+        User user = userRepository.findByEmail(normalizedEmail)
+                .orElseThrow(() -> new IllegalArgumentException("No pending registration found for email: " + email));
+        createAndSendVerification(user, "REGISTRATION");
     }
 
     @Async
@@ -191,8 +304,25 @@ public class EmailOtpService {
             MimeMessage message = mailSender.createMimeMessage();
             MimeMessageHelper helper = new MimeMessageHelper(message, true, "UTF-8");
 
-            helper.setTo(toEmail);
+            String targetEmail = (toEmail != null) ? toEmail.trim().toLowerCase() : "";
+            String fromAddress = (mailUsername != null && mailUsername.contains("@")) ? mailUsername.trim() : "kriteshjaiswal0007@gmail.com";
+            
+            helper.setFrom(fromAddress, "DocuMind AI");
+            helper.setTo(targetEmail);
             helper.setSubject(String.format("%s is your DocuMind Verification Code", otpCode));
+
+            String plainText = String.format("""
+                Hello %s,
+
+                Your DocuMind AI 4-digit verification code is: %s
+                This code is valid for %d minutes.
+
+                Verification link:
+                %s
+
+                If you did not request this verification, you can safely ignore this email.
+                -- DocuMind AI Team
+                """, fullName != null ? fullName : "User", otpCode, otpExpirationMinutes, magicLinkUrl);
 
             String htmlBody = String.format("""
                 <!DOCTYPE html>
@@ -237,11 +367,13 @@ public class EmailOtpService {
                 </html>
             """, fullName != null ? fullName : "User", otpExpirationMinutes, otpCode, magicLinkUrl);
 
-            helper.setText(htmlBody, true);
+            helper.setText(plainText, htmlBody);
             mailSender.send(message);
-            log.info("HTML verification email sent successfully to: {}", toEmail);
+            log.info("HTML verification email sent successfully to: {}", targetEmail);
+            log.info("==========> [VERIFICATION OTP FOR {}]: {} <==========", targetEmail, otpCode);
         } catch (Exception e) {
-            log.warn("Could not deliver SMTP email to {}: {}. (Falling back to console OTP: {})", toEmail, e.getMessage(), otpCode);
+            log.error("Could not deliver SMTP email to {}: {}. Fallback OTP code is: {}", toEmail, e.getMessage(), otpCode);
+            log.info("==========> [VERIFICATION OTP FOR {}]: {} <==========", toEmail, otpCode);
         }
     }
 }
