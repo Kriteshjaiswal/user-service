@@ -48,8 +48,17 @@ public class SessionAuthenticationFilter extends OncePerRequestFilter {
                         if (email != null && !jwtService.isTokenExpired(tokenOrSessionId)) {
                             Optional<User> uOpt = userRepository.findByEmail(email);
                             if (uOpt.isPresent()) {
-                                user = uOpt.get();
                                 activeSessionId = claims.get("sessionId", String.class);
+                                if (activeSessionId != null && !activeSessionId.isBlank()) {
+                                    try {
+                                        user = sessionService.validateAndSlideSession(activeSessionId);
+                                    } catch (Exception ex) {
+                                        log.info("Session [{}] expired or invalid in session store: {}", activeSessionId, ex.getMessage());
+                                        user = null; // Session expired: reject request!
+                                    }
+                                } else {
+                                    user = uOpt.get();
+                                }
                             }
                         }
                     } catch (Exception ignored) {}

@@ -122,6 +122,33 @@ public class EmailOtpService {
     }
 
     /**
+     * Generates a 4-digit numeric OTP for password reset and dispatches email.
+     */
+    @Transactional
+    public UserVerification createAndSendPasswordResetOtp(User user) {
+        int codeInt = 1000 + RANDOM.nextInt(9000);
+        String otpCode = String.valueOf(codeInt);
+        String resetToken = UUID.randomUUID().toString().replace("-", "");
+        LocalDateTime expiresAt = LocalDateTime.now().plusMinutes(otpExpirationMinutes);
+
+        UserVerification verification = UserVerification.builder()
+                .userId(user.getId())
+                .otpCode(otpCode)
+                .token(resetToken)
+                .type("PASSWORD_RESET")
+                .expiresAt(expiresAt)
+                .isUsed(false)
+                .attempts(0)
+                .build();
+
+        UserVerification saved = verificationRepository.save(verification);
+        sendHtmlPasswordResetEmail(user.getEmail(), user.getFullName(), otpCode);
+
+        log.info("Generated 4-digit password reset OTP [{}] for user: {} (Expires in {} mins)", otpCode, user.getEmail(), otpExpirationMinutes);
+        return saved;
+    }
+
+    /**
      * Validates 4-digit OTP. If from pending registration, SAVES user to database ONLY NOW upon success.
      */
     @Transactional
@@ -214,6 +241,55 @@ public class EmailOtpService {
 
         log.info("User {} successfully verified with OTP code.", user.getEmail());
         return updatedUser;
+    }
+
+    /**
+     * Validates 4-digit OTP for password reset without consuming it immediately.
+     */
+    @Transactional
+    public UserVerification verifyPasswordResetOtp(String email, String otpCode) {
+        String normalizedEmail = email != null ? email.trim().toLowerCase() : "";
+        String normalizedCode = otpCode != null ? otpCode.trim() : "";
+
+        User user = userRepository.findByEmail(normalizedEmail)
+                .orElseThrow(() -> new IllegalArgumentException("No user account found with email: " + email));
+
+        UserVerification verification = verificationRepository
+                .findTopByUserIdAndTypeAndIsUsedFalseOrderByCreatedAtDesc(user.getId(), "PASSWORD_RESET")
+                .orElseThrow(() -> new IllegalArgumentException("No pending password reset request found. Please request a new code."));
+
+        if (verification.isExpired()) {
+            throw new IllegalArgumentException("The password reset code has expired. Please request a new code.");
+        }
+
+        verification.setAttempts(verification.getAttempts() + 1);
+
+        if (verification.getAttempts() > 5) {
+            verification.setUsed(true);
+            verificationRepository.save(verification);
+            throw new IllegalArgumentException("Too many invalid attempts. Please request a new password reset code.");
+        }
+
+        if (!verification.getOtpCode().equals(normalizedCode)) {
+            verificationRepository.save(verification);
+            throw new IllegalArgumentException("Invalid 4-digit OTP code. Please check your email and try again.");
+        }
+
+        verificationRepository.save(verification);
+        return verification;
+    }
+
+    /**
+     * Validates and consumes the password reset OTP.
+     */
+    @Transactional
+    public User consumePasswordResetOtp(String email, String otpCode) {
+        UserVerification verification = verifyPasswordResetOtp(email, otpCode);
+        verification.setUsed(true);
+        verificationRepository.save(verification);
+
+        return userRepository.findById(verification.getUserId())
+                .orElseThrow(() -> new IllegalArgumentException("User not found for password reset"));
     }
 
     /**
@@ -374,6 +450,79 @@ public class EmailOtpService {
         } catch (Exception e) {
             log.error("Could not deliver SMTP email to {}: {}. Fallback OTP code is: {}", toEmail, e.getMessage(), otpCode);
             log.info("==========> [VERIFICATION OTP FOR {}]: {} <==========", toEmail, otpCode);
+        }
+    }
+
+    public void sendHtmlPasswordResetEmail(String toEmail, String fullName, String otpCode) {
+        try {
+            if (mailSender == null) {
+                log.info("[MOCK EMAIL] To: {} | Password Reset OTP Code: {}", toEmail, otpCode);
+                return;
+            }
+
+            MimeMessage message = mailSender.createMimeMessage();
+            MimeMessageHelper helper = new MimeMessageHelper(message, true, "UTF-8");
+
+            String targetEmail = (toEmail != null) ? toEmail.trim().toLowerCase() : "";
+            String fromAddress = (mailUsername != null && mailUsername.contains("@")) ? mailUsername.trim() : "kriteshjaiswal0007@gmail.com";
+
+            helper.setFrom(fromAddress, "DocuMind AI");
+            helper.setTo(targetEmail);
+            helper.setSubject(String.format("%s is your DocuMind Password Reset Code", otpCode));
+
+            String plainText = String.format("""
+                Hello %s,
+
+                We received a request to reset your DocuMind AI password.
+                Your 4-digit password reset code is: %s
+                This code is valid for %d minutes.
+
+                If you did not request a password reset, you can safely ignore this email.
+                -- DocuMind AI Team
+                """, fullName != null ? fullName : "User", otpCode, otpExpirationMinutes);
+
+            String htmlBody = String.format("""
+                <!DOCTYPE html>
+                <html>
+                <head>
+                    <meta charset="UTF-8">
+                    <style>
+                        body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif; background-color: #050816; color: #f8fafc; margin: 0; padding: 24px; }
+                        .container { max-width: 520px; margin: 0 auto; background-color: #0b1120; border: 1px solid #1e293b; border-radius: 16px; padding: 32px; box-shadow: 0 10px 25px -5px rgba(0, 0, 0, 0.5); }
+                        .logo { font-size: 20px; font-weight: 800; color: #38bdf8; text-align: center; margin-bottom: 24px; letter-spacing: -0.5px; }
+                        .title { font-size: 22px; font-weight: 700; color: #ffffff; text-align: center; margin-bottom: 12px; }
+                        .desc { font-size: 14px; color: #94a3b8; line-height: 1.6; text-align: center; margin-bottom: 28px; }
+                        .otp-box { background: linear-gradient(135deg, rgba(239, 68, 68, 0.1), rgba(99, 102, 241, 0.15)); border: 2px dashed #6366f1; border-radius: 12px; padding: 18px; text-align: center; margin-bottom: 28px; }
+                        .otp-code { font-size: 36px; font-weight: 800; letter-spacing: 12px; color: #38bdf8; font-family: monospace; }
+                        .footer { font-size: 12px; color: #64748b; text-align: center; margin-top: 32px; border-top: 1px solid #1e293b; padding-top: 18px; }
+                    </style>
+                </head>
+                <body>
+                    <div class="container">
+                        <div class="logo">⚡ DocuMind AI</div>
+                        <div class="title">Reset Your Password</div>
+                        <div class="desc">Hello %s,<br>We received a request to reset the password for your DocuMind AI account. Please enter the 4-digit code below to set a new password. This code is valid for <strong>%d minutes</strong>.</div>
+                        
+                        <div class="otp-box">
+                            <div class="otp-code">%s</div>
+                        </div>
+
+                        <div class="footer">
+                            If you did not request a password reset, please safely ignore this email. Your account remains secure.<br>
+                            &copy; 2026 DocuMind AI Document Systems. All rights reserved.
+                        </div>
+                    </div>
+                </body>
+                </html>
+            """, fullName != null ? fullName : "User", otpExpirationMinutes, otpCode);
+
+            helper.setText(plainText, htmlBody);
+            mailSender.send(message);
+            log.info("Password reset HTML email sent successfully to: {}", targetEmail);
+            log.info("==========> [PASSWORD RESET OTP FOR {}]: {} <==========", targetEmail, otpCode);
+        } catch (Exception e) {
+            log.error("Could not deliver SMTP reset email to {}: {}. Fallback OTP code is: {}", toEmail, e.getMessage(), otpCode);
+            log.info("==========> [PASSWORD RESET OTP FOR {}]: {} <==========", toEmail, otpCode);
         }
     }
 }

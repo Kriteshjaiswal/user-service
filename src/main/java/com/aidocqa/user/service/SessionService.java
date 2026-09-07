@@ -108,8 +108,15 @@ public class SessionService {
 
         LocalDateTime now = LocalDateTime.now();
 
-        // Enforce 10-Minute Inactivity Window
-        if (session.getLastActivityAt().plusMinutes(inactivityTimeoutMinutes).isBefore(now)) {
+        // Enforce 10-Minute Inactivity Window (respect Redis sliding TTL kept fresh by Gateway requests)
+        boolean activeInRedis = false;
+        try {
+            if (redisTemplate != null) {
+                activeInRedis = Boolean.TRUE.equals(redisTemplate.hasKey(REDIS_SESSION_PREFIX + sessionId));
+            }
+        } catch (Exception ignored) {}
+
+        if (!activeInRedis && session.getLastActivityAt().plusMinutes(inactivityTimeoutMinutes).isBefore(now)) {
             session.setActive(false);
             sessionRepository.save(session);
 

@@ -104,6 +104,37 @@ public class AuthController {
         return ResponseEntity.ok(ApiResponseDto.success("OAuth configuration retrieved", oauthService.getOAuthConfig()));
     }
 
+    @PostMapping("/forgot-password")
+    @Operation(summary = "Forgot Password", description = "Dispatches a 4-digit password reset OTP to user email")
+    public ResponseEntity<ApiResponseDto<Void>> forgotPassword(
+            @Valid @RequestBody ForgotPasswordRequestDto request,
+            HttpServletRequest httpRequest) {
+
+        String ip = extractClientIp(httpRequest);
+        authService.forgotPassword(request.getEmail(), ip);
+        return ResponseEntity.ok(ApiResponseDto.success("A 4-digit password reset code has been sent to your registered email."));
+    }
+
+    @PostMapping("/verify-reset-otp")
+    @Operation(summary = "Verify Reset OTP", description = "Validates the 4-digit password reset OTP before showing new password screen")
+    public ResponseEntity<ApiResponseDto<Void>> verifyResetOtp(
+            @Valid @RequestBody VerifyResetOtpRequestDto request) {
+
+        authService.verifyResetOtp(request.getEmail(), request.getOtpCode());
+        return ResponseEntity.ok(ApiResponseDto.success("Verification code confirmed. You can now set your new password."));
+    }
+
+    @PostMapping("/reset-password")
+    @Operation(summary = "Reset Password", description = "Sets new password using verified 4-digit OTP")
+    public ResponseEntity<ApiResponseDto<UserResponseDto>> resetPassword(
+            @Valid @RequestBody ResetPasswordRequestDto request,
+            HttpServletRequest httpRequest) {
+
+        String ip = extractClientIp(httpRequest);
+        UserResponseDto updated = authService.resetPassword(request.getEmail(), request.getOtpCode(), request.getNewPassword(), ip);
+        return ResponseEntity.ok(ApiResponseDto.success("Your password has been reset successfully. Please log in with your new password.", updated));
+    }
+
     @PostMapping("/set-password")
     @Operation(summary = "Set Local Password", description = "Allows OAuth users or verified users to set a local password")
     public ResponseEntity<ApiResponseDto<UserResponseDto>> setPassword(

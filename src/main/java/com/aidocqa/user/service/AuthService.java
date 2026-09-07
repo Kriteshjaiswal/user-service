@@ -210,6 +210,68 @@ public class AuthService {
     }
 
     /**
+     * Dispatches a 4-digit OTP for password reset.
+     */
+    @Transactional
+    public void forgotPassword(String email, String ipAddress) {
+        String normalizedEmail = email != null ? email.trim().toLowerCase() : "";
+        User user = userRepository.findByEmail(normalizedEmail)
+                .orElseThrow(() -> new IllegalArgumentException("No account found with this email address. Please check your email or create an account."));
+
+        emailOtpService.createAndSendPasswordResetOtp(user);
+
+        try {
+            auditLogRepository.save(UserAuditLog.builder()
+                    .userId(user.getId())
+                    .action("PASSWORD_RESET_REQUESTED")
+                    .ipAddress(ipAddress)
+                    .details("Requested 4-digit OTP for password reset")
+                    .build());
+        } catch (Exception e) {
+            log.warn("Audit log save skipped: {}", e.getMessage());
+        }
+
+        log.info("Password reset OTP requested for user: {}", normalizedEmail);
+    }
+
+    /**
+     * Validates 4-digit OTP for password reset before showing new password screen.
+     */
+    @Transactional(readOnly = true)
+    public void verifyResetOtp(String email, String otpCode) {
+        emailOtpService.verifyPasswordResetOtp(email, otpCode);
+    }
+
+    /**
+     * Verifies 4-digit OTP and resets the user's password.
+     */
+    @Transactional
+    public UserResponseDto resetPassword(String email, String otpCode, String newPassword, String ipAddress) {
+        User user = emailOtpService.consumePasswordResetOtp(email, otpCode);
+
+        user.setPasswordHash(passwordEncoder.encode(newPassword));
+        user.setEmailVerified(true);
+        if ("PENDING_VERIFICATION".equalsIgnoreCase(user.getAccountStatus())) {
+            user.setAccountStatus("ACTIVE");
+        }
+        User updated = userRepository.save(user);
+
+        try {
+            auditLogRepository.save(UserAuditLog.builder()
+                    .userId(user.getId())
+                    .action("PASSWORD_RESET_SUCCESS")
+                    .ipAddress(ipAddress)
+                    .details("Password successfully reset via 4-digit OTP")
+                    .build());
+        } catch (Exception e) {
+            log.warn("Audit log save skipped: {}", e.getMessage());
+        }
+
+        log.info("User {} successfully reset their password.", user.getEmail());
+        return mapToUserResponse(updated, 0, null);
+    }
+
+    /**
      * Logs out the user from current session.
      */
     @Transactional
